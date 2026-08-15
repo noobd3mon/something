@@ -6,6 +6,7 @@
    1. Kiem tra quyen Administrator
    2. Tai + cai dat Sunshine im lang (uu tien MSI, fallback EXE)
    3. Bat dich vu am thanh Windows (Audiosrv + AudioEndpointBuilder, startup = auto)
+      va tu cai virtual audio driver VB-CABLE khi may khong co card am thanh
    4. Bat service SunshineService va cho tu dong chay cung Windows
    5. Mo firewall cho cac port cua Sunshine, roi TAT Windows Firewall (yeu cau VPS)
    6. Dat mat khau tai khoan Windows (mac dinh @Noobdz123 hoac tu nhap + confirm)
@@ -54,6 +55,15 @@ param(
     # Ten dang nhap Web UI Sunshine.
     [string]$WebUiUser = 'admin',
 
+    # Bo qua viec cai virtual audio driver (VB-CABLE).
+    [switch]$SkipVirtualAudio,
+
+    # Cai VB-CABLE du may da co thiet bi phat am thanh.
+    [switch]$ForceVirtualAudio,
+
+    # Link .zip driver pack VB-CABLE khac (neu muon tu chon phien ban).
+    [string]$VirtualAudioUrl,
+
     # Cai lai Sunshine du da co san.
     [switch]$Force
 )
@@ -68,6 +78,8 @@ $script:ServiceName     = 'SunshineService'
 $script:LogFile         = Join-Path $env:ProgramData 'sunshine-setup.log'
 $script:TcpPorts        = @('47984-47990', '48010')
 $script:UdpPorts        = @('5353', '47998-48010', '48100-48110')
+$script:VbCableUrl      = 'https://download.vb-audio.com/Download_CABLE/VBCABLE_Driver_Pack43.zip'
+$script:VirtualAudioRe  = 'VB-Audio|VB-CABLE|CABLE Input|Virtual Cable|Virtual Audio'
 
 try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
 try { Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force -ErrorAction SilentlyContinue } catch {}
@@ -82,6 +94,10 @@ if ($env:SUNSHINE_KEEP_FIREWALL -eq '1')                            { $KeepFirew
 if ($env:SUNSHINE_NO_BROWSER -eq '1')                               { $NoBrowser = $true }
 if ($env:SUNSHINE_SKIP_WEBUI_CREDS -eq '1')                         { $SkipWebUiCreds = $true }
 if ($env:SUNSHINE_FORCE -eq '1')                                    { $Force = $true }
+if ($env:SUNSHINE_SKIP_VIRTUAL_AUDIO -eq '1')                       { $SkipVirtualAudio = $true }
+if ($env:SUNSHINE_FORCE_VIRTUAL_AUDIO -eq '1')                      { $ForceVirtualAudio = $true }
+if (-not $VirtualAudioUrl -and $env:SUNSHINE_VIRTUAL_AUDIO_URL)     { $VirtualAudioUrl = $env:SUNSHINE_VIRTUAL_AUDIO_URL }
+if ($VirtualAudioUrl)                                               { $script:VbCableUrl = $VirtualAudioUrl }
 
 # ------------------------------------------------------------------- Helpers --
 function Write-Line {
@@ -295,9 +311,226 @@ function Enable-AudioServices {
         if ($devices) {
             foreach ($d in $devices) { Write-Note ('Thiet bi am thanh: ' + $d.Name + ' [' + $d.Status + ']') }
         } else {
-            Write-Warn 'Khong thay thiet bi am thanh nao. Nen cai them virtual audio driver (VB-CABLE, Virtual Audio Cable...) de Sunshine co dau ra tieng.'
+            Write-Note 'Khong co card am thanh vat ly (binh thuong voi VPS) -> se cai virtual audio driver ngay sau day.'
         }
     } catch {}
+}
+
+# ------------------------------------------------- Virtual audio (VB-CABLE) --
+function Get-AudioRenderNames {
+    # Liet ke cac thiet bi PHAT am thanh dang Active (doc tu registry MMDevices)
+    $names = New-Object System.Collections.Generic.List[string]
+    $base = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\MMDevices\Audio\Render'
+    if (-not (Test-Path -LiteralPath $base)) { return $names }
+
+    foreach ($key in @(Get-ChildItem -LiteralPath $base -ErrorAction SilentlyContinue)) {
+        $state = $null
+        try { $state = (Get-ItemProperty -LiteralPath $key.PSPath -Name 'DeviceState' -ErrorAction Stop).DeviceState } catch {}
+        if ($state -ne 1) { continue }
+
+        $friendly = $null
+        $propPath = $key.PSPath + '\Properties'
+        foreach ($prop in @('{b3f8fa53-0004-438e-9003-51a46e139bfc},6', '{a45c254e-df1c-4efd-8020-67d146a850e0},2')) {
+            if ($friendly) { continue }
+            try { $friendly = (Get-ItemProperty -LiteralPath $propPath -Name $prop -ErrorAction Stop).$prop } catch {}
+        }
+        if ($friendly) { $names.Add([string]$friendly) }
+    }
+    return $names
+}
+
+function Get-SunshineAudioDevices {
+    # Doc danh sach thiet bi bang tools\audio-info.exe cua Sunshine
+    $devices = New-Object System.Collections.Generic.List[object]
+    $exe = Get-SunshineExe
+    if (-not $exe) { return $devices }
+    $tool = Join-Path (Split-Path -Parent $exe) 'tools\audio-info.exe'
+    if (-not (Test-Path -LiteralPath $tool)) { return $devices }
+
+    $lines = @()
+    try { $lines = & $tool 2>&1 } catch { return $devices }
+    $current = $null
+    foreach ($raw in $lines) {
+        $line = [string]$raw
+        if ($line -match '^\s*Device name\s*:\s*(.+?)\s*$') {
+            $current = [pscustomobject]@{ Name = $Matches[1]; State = '' }
+            $devices.Add($current)
+        } elseif ($line -match '^\s*Device state\s*:\s*(.+?)\s*$') {
+            if ($current) { $current.State = $Matches[1] }
+        }
+    }
+    return $devices
+}
+
+function Add-DriverCertificate {
+    param([string]$Folder)
+    # Tin cay chung chi cua driver -> Windows khong hien popup "Would you like to install..."
+    $cats = @(Get-ChildItem -LiteralPath $Folder -Filter '*.cat' -Recurse -ErrorAction SilentlyContinue)
+    if ($cats.Count -eq 0) { return }
+    $added = 0
+    foreach ($cat in $cats) {
+        $cert = $null
+        try { $cert = (Get-AuthenticodeSignature -FilePath $cat.FullName -ErrorAction Stop).SignerCertificate } catch {}
+        if (-not $cert) { continue }
+        foreach ($storeName in @('TrustedPublisher', 'Root')) {
+            try {
+                $store = New-Object Security.Cryptography.X509Certificates.X509Store($storeName, 'LocalMachine')
+                $store.Open('ReadWrite')
+                $store.Add($cert)
+                $store.Close()
+                $added++
+            } catch {}
+        }
+    }
+    if ($added -gt 0) { Write-Note 'Da tin cay chung chi driver VB-Audio (khong can bam xac nhan khi cai).' }
+}
+
+function Wait-ForAudioDevice {
+    param([int]$TimeoutSec = 45, [int]$BaselineCount = 0)
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    while ($true) {
+        $names = @(Get-AudioRenderNames)
+        if (@($names -match $script:VirtualAudioRe).Count -gt 0) { return $true }
+        if ($names.Count -gt $BaselineCount) { return $true }
+        if ((Get-Date) -ge $deadline) { break }
+        Start-Sleep -Seconds 3
+    }
+    return $false
+}
+
+function Install-VbCable {
+    param([int]$BaselineCount = 0)
+    $work = Join-Path $env:ProgramData 'sunshine-setup\vbcable'
+    $done = $false
+    try {
+        try {
+            if (Test-Path -LiteralPath $work) { Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue }
+            New-Item -ItemType Directory -Path $work -Force | Out-Null
+        } catch { Write-Warn 'Khong tao duoc thu muc tam cho driver.'; return $false }
+
+        $zip = Join-Path $work 'VBCABLE_Driver_Pack.zip'
+        Write-Note ('Tai VB-CABLE: ' + $script:VbCableUrl)
+        try {
+            Invoke-WebRequest -Uri $script:VbCableUrl -OutFile $zip -UseBasicParsing -TimeoutSec 600
+        } catch {
+            try { (New-Object Net.WebClient).DownloadFile($script:VbCableUrl, $zip) }
+            catch { Write-Warn ('Tai VB-CABLE that bai: ' + $_.Exception.Message); return $false }
+        }
+        if (-not (Test-Path -LiteralPath $zip) -or (Get-Item -LiteralPath $zip).Length -lt 200KB) {
+            Write-Warn 'File VB-CABLE tai ve khong hop le.'
+            return $false
+        }
+
+        try { Expand-Archive -LiteralPath $zip -DestinationPath $work -Force }
+        catch { Write-Warn ('Khong giai nen duoc VB-CABLE: ' + $_.Exception.Message); return $false }
+
+        Add-DriverCertificate -Folder $work
+
+        $setupName = 'VBCABLE_Setup_x64.exe'
+        if ([IntPtr]::Size -eq 4) { $setupName = 'VBCABLE_Setup.exe' }
+        $setup = @(Get-ChildItem -LiteralPath $work -Filter $setupName -Recurse -ErrorAction SilentlyContinue) | Select-Object -First 1
+        if ($setup) {
+            Write-Note ('Cai im lang: ' + $setup.Name + ' -i -h')
+            try {
+                $proc = Start-Process -FilePath $setup.FullName -ArgumentList '-i', '-h' -PassThru -ErrorAction Stop
+                if (-not $proc.WaitForExit(300000)) { try { $proc.Kill() } catch {} }
+            } catch { Write-Warn ('Chay VBCABLE_Setup that bai: ' + $_.Exception.Message) }
+        } else {
+            Write-Warn ('Khong tim thay ' + $setupName + ' trong goi driver.')
+        }
+
+        $done = Wait-ForAudioDevice -TimeoutSec 45 -BaselineCount $BaselineCount
+        if (-not $done) {
+            # Du phong: cai thang tu file .inf
+            $inf = @(Get-ChildItem -LiteralPath $work -Filter '*.inf' -Recurse -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '64' }) | Select-Object -First 1
+            if (-not $inf) { $inf = @(Get-ChildItem -LiteralPath $work -Filter '*.inf' -Recurse -ErrorAction SilentlyContinue) | Select-Object -First 1 }
+            if ($inf) {
+                Write-Note ('Thu cai tu file INF: ' + $inf.Name)
+                try {
+                    $pnpArgs = @('/add-driver', $inf.FullName, '/install')
+                    & pnputil.exe @pnpArgs | Out-Null
+                } catch {}
+                try {
+                    $dllArgs = @('advpack.dll,LaunchINFSectionEx', ($inf.FullName + ',,,4'))
+                    & rundll32.exe @dllArgs | Out-Null
+                } catch {}
+                $done = Wait-ForAudioDevice -TimeoutSec 45 -BaselineCount $BaselineCount
+            }
+        }
+    } finally {
+        try { Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue } catch {}
+    }
+    return $done
+}
+
+function Set-SunshineAudioSink {
+    # Ghi audio_sink vao sunshine.conf de Sunshine lay dung thiet bi ao
+    $exe = Get-SunshineExe
+    if (-not $exe) { return }
+
+    $pick = $null
+    foreach ($d in @(Get-SunshineAudioDevices)) {
+        if ([string]$d.Name -match $script:VirtualAudioRe) { $pick = [string]$d.Name; break }
+    }
+    if (-not $pick) {
+        Write-Note 'Chua doc duoc ten thiet bi tu audio-info.exe -> de Sunshine tu chon thiet bi mac dinh.'
+        return
+    }
+
+    $conf    = Join-Path (Split-Path -Parent $exe) 'config\sunshine.conf'
+    $confDir = Split-Path -Parent $conf
+    try { if (-not (Test-Path -LiteralPath $confDir)) { New-Item -ItemType Directory -Path $confDir -Force | Out-Null } } catch {}
+
+    $kept = New-Object System.Collections.Generic.List[string]
+    if (Test-Path -LiteralPath $conf) {
+        $old = @()
+        try { $old = @(Get-Content -LiteralPath $conf -ErrorAction Stop) } catch {}
+        foreach ($line in $old) {
+            if ([string]$line -match '^\s*audio_sink\s*=') { continue }
+            $kept.Add([string]$line)
+        }
+    }
+    $kept.Add('audio_sink = ' + $pick)
+
+    try { [IO.File]::WriteAllLines($conf, $kept) }
+    catch { Write-Warn ('Khong ghi duoc sunshine.conf: ' + $_.Exception.Message); return }
+    Write-Ok ('Da dat audio_sink = ' + $pick)
+
+    try {
+        $svc = Get-Service -Name $script:ServiceName -ErrorAction SilentlyContinue
+        if ($svc -and $svc.Status -eq 'Running') {
+            Restart-Service -Name $script:ServiceName -Force -ErrorAction SilentlyContinue
+            Write-Note 'Da restart SunshineService de nap cau hinh am thanh.'
+        }
+    } catch {}
+}
+
+function Install-VirtualAudio {
+    if ($SkipVirtualAudio) {
+        Write-Note 'Bo qua virtual audio driver (-SkipVirtualAudio).'
+        return
+    }
+
+    $existing   = @(Get-AudioRenderNames)
+    $hasVirtual = @($existing -match $script:VirtualAudioRe).Count -gt 0
+
+    if ($existing.Count -gt 0 -and -not $ForceVirtualAudio) {
+        Write-Ok ('Thiet bi phat am thanh dang hoat dong: ' + ($existing -join ' | '))
+        if ($hasVirtual) { Set-SunshineAudioSink }
+        else { Write-Note 'Muon cai them VB-CABLE thi chay lai script voi -ForceVirtualAudio.' }
+        return
+    }
+
+    Write-Note 'May khong co dau ra am thanh -> cai VB-CABLE (VB-Audio Virtual Cable).'
+    if (Install-VbCable -BaselineCount $existing.Count) {
+        $names = @(Get-AudioRenderNames)
+        if ($names.Count -gt 0) { Write-Ok ('Thiet bi am thanh hien co: ' + ($names -join ' | ')) }
+        else { Write-Ok 'Da cai virtual audio driver.' }
+        Set-SunshineAudioSink
+    } else {
+        Write-Warn 'Chua thay thiet bi am thanh ao. Thu reboot VPS roi chay lai script.'
+        Write-Warn 'Hoac cai tay: https://vb-audio.com/Cable/ -> giai nen -> VBCABLE_Setup_x64.exe -> Install Driver.'
+    }
 }
 
 # ------------------------------------------------------------------- Service --
@@ -539,9 +772,10 @@ function Invoke-SunshineSetup {
         }
     }
 
-    # 3. Am thanh Windows
-    Write-Step 'Buoc 3/8: Bat dich vu am thanh cua Windows'
+    # 3. Am thanh Windows + virtual audio driver
+    Write-Step 'Buoc 3/8: Bat am thanh Windows + cai virtual audio driver'
     Enable-AudioServices
+    Install-VirtualAudio
 
     # 4. Service
     Write-Step 'Buoc 4/8: Bat service Sunshine (tu dong chay cung Windows)'
@@ -615,8 +849,8 @@ function Invoke-SunshineSetup {
     Write-Line '      va giu phien dang nhap (vi du dung: tscon 1 /dest:console) truoc khi ngat RDP.' 'Gray'
     Write-Line '   4. Ghep doi Moonlight: mo Web UI -> tab PIN -> nhap PIN ma Moonlight hien ra.' 'Gray'
     Write-Line '   5. Bat lai firewall khi can: Set-NetFirewallProfile -Profile Domain,Private,Public -Enabled True' 'Gray'
-    Write-Line '   6. Am thanh: da bat Audiosrv + AudioEndpointBuilder (startup = auto). Neu VPS khong co card am thanh,' 'Gray'
-    Write-Line '      cai them virtual audio driver (VB-CABLE...) roi chon dung Audio Sink trong Web UI Sunshine.' 'Gray'
+    Write-Line '   6. Am thanh: da bat Audiosrv + AudioEndpointBuilder va cai VB-CABLE khi may khong co card am thanh.' 'Gray'
+    Write-Line '      Xem thiet bi: & "$env:ProgramFiles\Sunshine\tools\audio-info.exe" - doi thiet bi o Web UI > Audio/Video.' 'Gray'
     Write-Line ''
 }
 
