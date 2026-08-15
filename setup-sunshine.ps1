@@ -2,9 +2,9 @@
 .SYNOPSIS
     Automated Sunshine & VPS Setup Script for Windows
 .DESCRIPTION
-    1. Sets Windows User Password (Default: @Noobdz123 or Custom with confirmation).
-    2. Completely disables Windows Firewall for remote streaming.
-    3. Downloads and installs Sunshine silently.
+    1. Sets Windows User Password (Default: @Noobdz123 or Custom).
+    2. Completely disables Windows Firewall.
+    3. Downloads and installs Sunshine silently (Fix download redirect error).
     4. Fetches Public IPv4 address.
     5. Opens Sunshine Web UI in the default browser.
 .NOTES
@@ -67,25 +67,41 @@ try {
 Write-Host "`n[+] Dang tat Windows Firewall de mo toan bo port VPS..." -ForegroundColor Cyan
 try {
     Set-NetFirewallProfile -Profile Domain, Public, Private -Enabled False
-    Write-Host "[+] Da tat hoan toan Windows Firewall (Domain, Public, Private)!" -ForegroundColor Green
+    Write-Host "[+] Da tat hoan toan Windows Firewall!" -ForegroundColor Green
 } catch {
     Write-Warning "Khong the tat Firewall: $_"
 }
 
 # ---------------------------------------------------------
-# 3. TAI VA CAI DAT SUNSHINE
+# 3. TAI VA CAI DAT SUNSHINE (FIXED DOWNLOAD ENGINE)
 # ---------------------------------------------------------
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls
 $TempDir = [System.IO.Path]::GetTempPath()
 $InstallerPath = Join-Path -Path $TempDir -ChildPath "sunshine-installer.exe"
-$DownloadUrl = "https://github.com/LizardByte/Sunshine/releases/latest/download/sunshine-windows-installer.exe"
 
-Write-Host "`n[+] Dang tai Sunshine Installer ban moi nhat..." -ForegroundColor Cyan
+Write-Host "`n[+] Dang tim link tai Sunshine ban moi nhat..." -ForegroundColor Cyan
+
+# Lay link truc tiep tu GitHub API de tranh loi 302 Redirect drop connection
+$DownloadUrl = $null
 try {
-    $OriginalProgressPreference = $ProgressPreference
-    $ProgressPreference = 'SilentlyContinue'
-    Invoke-WebRequest -Uri $DownloadUrl -OutFile $InstallerPath -UseBasicParsing
-    $ProgressPreference = $OriginalProgressPreference
+    $apiData = Invoke-RestMethod -Uri "https://api.github.com/repos/LizardByte/Sunshine/releases/latest" -Headers @{"User-Agent"="PowerShell"} -TimeoutSec 10
+    $asset = $apiData.assets | Where-Object { $_.name -like "*windows-installer.exe" } | Select-Object -First 1
+    if ($asset) {
+        $DownloadUrl = $asset.browser_download_url
+    }
+} catch {}
+
+if (-not $DownloadUrl) {
+    $DownloadUrl = "https://github.com/LizardByte/Sunshine/releases/latest/download/sunshine-windows-installer.exe"
+}
+
+Write-Host "[+] Dang tai Sunshine Installer tu: $DownloadUrl" -ForegroundColor Cyan
+
+try {
+    # Su dung WebClient voi User-Agent chuan de tranh bi ngat ket noi
+    $webClient = New-Object System.Net.WebClient
+    $webClient.Headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+    $webClient.DownloadFile($DownloadUrl, $InstallerPath)
     Write-Host "[+] Tai thanh cong: $InstallerPath" -ForegroundColor Green
 } catch {
     Write-Error "Loi tai Sunshine: $_"
@@ -101,16 +117,16 @@ try {
     Exit
 }
 
-# Setup thong tin tai khoan dang nhap Sunshine mac dinh (sunshine / @Noobdz123)
+# Setup credential mac dinh cho Sunshine
 $sunshineExe = "C:\Program Files\Sunshine\sunshine.exe"
 if (Test-Path $sunshineExe) {
     try {
         & "$sunshineExe" --creds admin "$finalPass" | Out-Null
-        Write-Host "[+] Da set tai khoan Sunshine: admin / $finalPass" -ForegroundColor Green
+        Write-Host "[+] Da khoi tao tai khoan Web UI: admin / $finalPass" -ForegroundColor Green
     } catch {}
 }
 
-# Xoa file cai dat
+# Don dep installer
 if (Test-Path $InstallerPath) {
     Remove-Item -Path $InstallerPath -Force
 }
@@ -131,7 +147,7 @@ try {
 # ---------------------------------------------------------
 # 5. MO TRINH DUYET VA HIEN THI THONG TIN
 # ---------------------------------------------------------
-Write-Host "[+] Dang mo Sunshine Web UI tren trinh duyet mac dinh..." -ForegroundColor Cyan
+Write-Host "[+] Dang mo Sunshine Web UI tren trinh duyet..." -ForegroundColor Cyan
 Start-Process "https://localhost:47990"
 
 Write-Host "`n==========================================================" -ForegroundColor Green
@@ -143,4 +159,3 @@ Write-Host " 3. Web UI Sunshine (Local)      : https://localhost:47990" -Foregro
 Write-Host " 4. Web UI Sunshine (Tu xa)      : https://${publicIp}:47990" -ForegroundColor Cyan
 Write-Host " 5. Dang nhap Sunshine Web UI    : admin / $finalPass" -ForegroundColor Cyan
 Write-Host "==========================================================" -ForegroundColor Green
-Write-Host "Luu y: Tren trinh duyet, hay chon 'Advanced' -> 'Proceed to localhost' vi chung chi SSL tu sinh." -ForegroundColor Gray
