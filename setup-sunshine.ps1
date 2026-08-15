@@ -4,7 +4,7 @@
 .DESCRIPTION
     1. Sets Windows User Password (Default: @Noobdz123 or Custom).
     2. Completely disables Windows Firewall.
-    3. Downloads and installs Sunshine silently (Fix download redirect error).
+    3. Auto-discovers and silently installs latest Sunshine release.
     4. Fetches Public IPv4 address.
     5. Opens Sunshine Web UI in the default browser.
 .NOTES
@@ -73,35 +73,41 @@ try {
 }
 
 # ---------------------------------------------------------
-# 3. TAI VA CAI DAT SUNSHINE (FIXED DOWNLOAD ENGINE)
+# 3. TAI VA CAI DAT SUNSHINE (AUTO RESOLVE ASSET URL)
 # ---------------------------------------------------------
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls11 -bor [Net.SecurityProtocolType]::Tls
 $TempDir = [System.IO.Path]::GetTempPath()
 $InstallerPath = Join-Path -Path $TempDir -ChildPath "sunshine-installer.exe"
 
-Write-Host "`n[+] Dang tim link tai Sunshine ban moi nhat..." -ForegroundColor Cyan
+Write-Host "`n[+] Dang quet link tai Sunshine tu GitHub Releases..." -ForegroundColor Cyan
 
-# Lay link truc tiep tu GitHub API de tranh loi 302 Redirect drop connection
 $DownloadUrl = $null
 try {
-    $apiData = Invoke-RestMethod -Uri "https://api.github.com/repos/LizardByte/Sunshine/releases/latest" -Headers @{"User-Agent"="PowerShell"} -TimeoutSec 10
-    $asset = $apiData.assets | Where-Object { $_.name -like "*windows-installer.exe" } | Select-Object -First 1
-    if ($asset) {
-        $DownloadUrl = $asset.browser_download_url
+    $apiResponse = Invoke-RestMethod -Uri "https://api.github.com/repos/LizardByte/Sunshine/releases/latest" -Headers @{"User-Agent"="PowerShell"} -TimeoutSec 10
+    $exeAsset = $apiResponse.assets | Where-Object { $_.name -like "*installer.exe" -or ($_.name -like "*.exe" -and $_.name -notlike "*portable*") } | Select-Object -First 1
+    if ($exeAsset) {
+        $DownloadUrl = $exeAsset.browser_download_url
+        Write-Host "[+] Tim thay file: $($exeAsset.name)" -ForegroundColor Green
     }
-} catch {}
-
-if (-not $DownloadUrl) {
-    $DownloadUrl = "https://github.com/LizardByte/Sunshine/releases/latest/download/sunshine-windows-installer.exe"
+} catch {
+    Write-Warning "Khong truy van duoc GitHub API: $_"
 }
 
-Write-Host "[+] Dang tai Sunshine Installer tu: $DownloadUrl" -ForegroundColor Cyan
+# Link du phong neu bi rate limit GitHub API
+if (-not $DownloadUrl) {
+    $DownloadUrl = "https://github.com/LizardByte/Sunshine/releases/latest/download/sunshine-windows-amd64-installer.exe"
+}
+
+Write-Host "[+] Dang tai Sunshine tu: $DownloadUrl" -ForegroundColor Cyan
 
 try {
-    # Su dung WebClient voi User-Agent chuan de tranh bi ngat ket noi
-    $webClient = New-Object System.Net.WebClient
-    $webClient.Headers.Add("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
-    $webClient.DownloadFile($DownloadUrl, $InstallerPath)
+    $OriginalProgressPreference = $ProgressPreference
+    $ProgressPreference = 'SilentlyContinue'
+    
+    # Dung BITS / Invoke-WebRequest voi User-Agent chuan
+    Invoke-WebRequest -Uri $DownloadUrl -OutFile $InstallerPath -UseBasicParsing -UserAgent "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+    
+    $ProgressPreference = $OriginalProgressPreference
     Write-Host "[+] Tai thanh cong: $InstallerPath" -ForegroundColor Green
 } catch {
     Write-Error "Loi tai Sunshine: $_"
@@ -126,7 +132,7 @@ if (Test-Path $sunshineExe) {
     } catch {}
 }
 
-# Don dep installer
+# Don dep file installer
 if (Test-Path $InstallerPath) {
     Remove-Item -Path $InstallerPath -Force
 }
@@ -159,3 +165,4 @@ Write-Host " 3. Web UI Sunshine (Local)      : https://localhost:47990" -Foregro
 Write-Host " 4. Web UI Sunshine (Tu xa)      : https://${publicIp}:47990" -ForegroundColor Cyan
 Write-Host " 5. Dang nhap Sunshine Web UI    : admin / $finalPass" -ForegroundColor Cyan
 Write-Host "==========================================================" -ForegroundColor Green
+Write-Host "Luu y: Tren trinh duyet, chon 'Advanced' -> 'Proceed to localhost' do SSL tu ky." -ForegroundColor Gray
