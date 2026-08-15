@@ -1,143 +1,146 @@
-@'
-# 1. Kiem tra va yeu cau quyen Administrator
-if (!([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-    Write-Host '[!] Dang yeu cau quyen Administrator...' -ForegroundColor Yellow
-    Start-Process powershell.exe "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`"" -Verb RunAs
-    exit
-}
+<#
+.SYNOPSIS
+    Automated Sunshine & VPS Setup Script for Windows
+.DESCRIPTION
+    1. Sets Windows User Password (Default: @Noobdz123 or Custom with confirmation).
+    2. Completely disables Windows Firewall for remote streaming.
+    3. Downloads and installs Sunshine silently.
+    4. Fetches Public IPv4 address.
+    5. Opens Sunshine Web UI in the default browser.
+.NOTES
+    Run as Administrator.
+#>
+
+#Requires -RunAsAdministrator
+$ErrorActionPreference = "Stop"
 
 Clear-Host
-Write-Host '==========================================================' -ForegroundColor Cyan
-Write-Host '   BAT DAU CAU HINH VPS & CAI DAT SUNSHINE STREAMING      ' -ForegroundColor Cyan
-Write-Host '==========================================================' -ForegroundColor Cyan
-Write-Host ''
+Write-Host "==========================================================" -ForegroundColor Cyan
+Write-Host "         AUTO SETUP SUNSHINE & VPS CONFIGURATION          " -ForegroundColor Yellow
+Write-Host "==========================================================" -ForegroundColor Cyan
+Write-Host ""
 
-# 2. Thiet lap mat khau may (User Windows)
-$currentUser = $env:USERNAME
-Write-Host "[1/5] THIET LAP MAT KHAU CHO USER: $currentUser" -ForegroundColor Green
-Write-Host '  [1] Dung mat khau mac dinh: @Noobdz123.'
-Write-Host '  [2] Tu nhap mat khau moi theo y ban'
-$choice = Read-Host '-> Chon (Nhan Enter de chon mac dinh [1])'
+# ---------------------------------------------------------
+# 1. THIET LAP MAT KHAU WINDOWS
+# ---------------------------------------------------------
+$currentUser = [System.Environment]::UserName
+Write-Host "[+] Nguoi dung hien tai tren VPS: $currentUser" -ForegroundColor Green
 
-$finalPassword = ''
+$defaultPass = "@Noobdz123"
+Write-Host "Lua chon dat mat khau cho Windows:" -ForegroundColor Cyan
+Write-Host "  [1] Dung mat khau mac dinh: $defaultPass (Nhan Enter hoac chon 1)" -ForegroundColor Gray
+Write-Host "  [2] Tu nhap mat khau moi" -ForegroundColor Gray
+$choice = Read-Host "Nhap lua chon [1/2] (Mac dinh 1)"
 
-if ($choice -eq '2') {
-    $match = $false
-    while (-not $match) {
-        $p1 = Read-Host '-> Nhap mat khau moi' -AsSecureString
-        $p2 = Read-Host '-> Xac nhan lai mat khau moi' -AsSecureString
+$finalPass = $defaultPass
+
+if ($choice -eq "2") {
+    while ($true) {
+        $p1 = Read-Host "Nhap mat khau moi" -AsSecureString
+        $p2 = Read-Host "Xac nhan lai mat khau" -AsSecureString
         
-        $p1_plain = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto([System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($p1))
-        $p2_plain = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto([System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($p2))
+        $bstr1 = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($p1)
+        $bstr2 = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($p2)
+        $plain1 = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr1)
+        $plain2 = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr2)
         
-        if ($p1_plain -eq $p2_plain -and $p1_plain.Length -gt 0) {
-            $finalPassword = $p1_plain
-            $match = $true
+        if ($plain1 -eq $plain2 -and -not [string]::IsNullOrWhiteSpace($plain1)) {
+            $finalPass = $plain1
+            Write-Host "[OK] Mat khau xac nhan hop le!" -ForegroundColor Green
+            break
         } else {
-            Write-Host '[-] Mat khau khong khop hoac de trong! Vui long nhap lai.' -ForegroundColor Red
+            Write-Host "[!] Mat khau khong khop hoac de trong, vui long thu lai.`n" -ForegroundColor Red
         }
     }
-} else {
-    $finalPassword = '@Noobdz123.'
 }
 
-# Doi mat khau tai khoan
 try {
-    net user "$currentUser" "$finalPassword" | Out-Null
-    Write-Host "[+] Da doi mat khau cho user '$currentUser' thanh cong!" -ForegroundColor Green
+    net user "$currentUser" "$finalPass" | Out-Null
+    Write-Host "[+] Da set mat khau Windows thanh cong!" -ForegroundColor Green
 } catch {
-    Write-Host "[-] Khong the doi mat khau qua net user: $_" -ForegroundColor Red
+    Write-Warning "Khong the set mat khau qua net user: $_"
 }
 
-Write-Host ''
-
-# 3. Tat Windows Firewall de mo port Sunshine
-Write-Host '[2/5] TAT TUONG LUA (WINDOWS FIREWALL)...' -ForegroundColor Green
+# ---------------------------------------------------------
+# 2. TAT TUONG LUA (WINDOWS FIREWALL)
+# ---------------------------------------------------------
+Write-Host "`n[+] Dang tat Windows Firewall de mo toan bo port VPS..." -ForegroundColor Cyan
 try {
     Set-NetFirewallProfile -Profile Domain, Public, Private -Enabled False
-    Write-Host '[+] Da tat toan bo Windows Firewall (Domain, Public, Private).' -ForegroundColor Green
+    Write-Host "[+] Da tat hoan toan Windows Firewall (Domain, Public, Private)!" -ForegroundColor Green
 } catch {
-    Write-Host "[-] Loi khi tat Firewall: $_" -ForegroundColor Red
+    Write-Warning "Khong the tat Firewall: $_"
 }
 
-Write-Host ''
+# ---------------------------------------------------------
+# 3. TAI VA CAI DAT SUNSHINE
+# ---------------------------------------------------------
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$TempDir = [System.IO.Path]::GetTempPath()
+$InstallerPath = Join-Path -Path $TempDir -ChildPath "sunshine-installer.exe"
+$DownloadUrl = "https://github.com/LizardByte/Sunshine/releases/latest/download/sunshine-windows-installer.exe"
 
-# 4. Tai va cai dat Sunshine moi nhat tu GitHub
-Write-Host '[3/5] TAI VA CAI DAT SUNSHINE...' -ForegroundColor Green
-$installerPath = "$env:TEMP\sunshine-installer.exe"
-
+Write-Host "`n[+] Dang tai Sunshine Installer ban moi nhat..." -ForegroundColor Cyan
 try {
-    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
-    Write-Host '-> Dang kiem tra phien ban moi nhat tu GitHub LizardByte/Sunshine...' -ForegroundColor Gray
-    
-    $apiUrl = 'https://api.github.com/repos/LizardByte/Sunshine/releases/latest'
-    $releaseInfo = Invoke-RestMethod -Uri $apiUrl -Headers @{'User-Agent'='PowerShell'}
-    
-    $asset = $releaseInfo.assets | Where-Object { $_.name -like '*sunshine-windows-installer.exe' -or $_.name -like 'sunshine-windows-*.exe' } | Select-Object -First 1
-    
-    if ($asset) {
-        $downloadUrl = $asset.browser_download_url
-        Write-Host "-> Dang tai: $($asset.name)..." -ForegroundColor Gray
-        Invoke-WebRequest -Uri $downloadUrl -OutFile $installerPath
-        
-        Write-Host '-> Dang tien hanh cai dat ngam (Silent Install)...' -ForegroundColor Gray
-        Start-Process -FilePath $installerPath -ArgumentList '/S' -Wait
-        Write-Host '[+] Da cai dat Sunshine thanh cong!' -ForegroundColor Green
-    } else {
-        throw 'Khong tim thay file exe bo cai trong release moi nhat.'
-    }
+    $OriginalProgressPreference = $ProgressPreference
+    $ProgressPreference = 'SilentlyContinue'
+    Invoke-WebRequest -Uri $DownloadUrl -OutFile $InstallerPath -UseBasicParsing
+    $ProgressPreference = $OriginalProgressPreference
+    Write-Host "[+] Tai thanh cong: $InstallerPath" -ForegroundColor Green
 } catch {
-    Write-Host "[-] Khong tai duoc tu GitHub release ($($_)). Chuyen sang cai qua winget..." -ForegroundColor Yellow
-    winget install LizardByte.Sunshine --silent --accept-package-agreements --accept-source-agreements
+    Write-Error "Loi tai Sunshine: $_"
+    Exit
 }
 
-Write-Host ''
+Write-Host "[+] Dang cai dat Sunshine (Silent)..." -ForegroundColor Cyan
+try {
+    $process = Start-Process -FilePath $InstallerPath -ArgumentList "/S" -PassThru -Wait
+    Write-Host "[+] Cai dat Sunshine hoan tat!" -ForegroundColor Green
+} catch {
+    Write-Error "Loi cai dat Sunshine: $_"
+    Exit
+}
 
-# 5. Khoi chay Sunshine Service & Mo Web UI
-Write-Host '[4/5] KHOI CHAY SUNSHINE & MO TRINH DUYET...' -ForegroundColor Green
-$sunshineExe = 'C:\Program Files\Sunshine\sunshine.exe'
+# Setup thong tin tai khoan dang nhap Sunshine mac dinh (sunshine / @Noobdz123)
+$sunshineExe = "C:\Program Files\Sunshine\sunshine.exe"
 if (Test-Path $sunshineExe) {
-    Start-Process -FilePath $sunshineExe -WindowStyle Hidden
+    try {
+        & "$sunshineExe" --creds admin "$finalPass" | Out-Null
+        Write-Host "[+] Da set tai khoan Sunshine: admin / $finalPass" -ForegroundColor Green
+    } catch {}
 }
 
-Start-Sleep -Seconds 3
+# Xoa file cai dat
+if (Test-Path $InstallerPath) {
+    Remove-Item -Path $InstallerPath -Force
+}
 
-# Mo link quan ly Sunshine tren trinh duyet mac dinh
-$webUiUrl = 'https://localhost:47990'
-Write-Host "-> Dang mo Web UI tai: $webUiUrl" -ForegroundColor Gray
-Start-Process $webUiUrl
-
-Write-Host ''
-
-# 6. Lay dia chi IPv4 Public cua may
-Write-Host '[5/5] LAY THONG TIN DIA CHI IPV4 CUA VPS...' -ForegroundColor Green
-$publicIp = 'Khong xac dinh'
+# ---------------------------------------------------------
+# 4. LAY IPV4 VA THONG TIN KET NOI
+# ---------------------------------------------------------
+Write-Host "`n[+] Dang lay dia chi IPv4 cua VPS..." -ForegroundColor Cyan
+$publicIp = "Khong lay duoc IP"
 try {
-    $publicIp = (Invoke-RestMethod -Uri 'https://api.ipify.org' -TimeoutSec 6).Trim()
+    $publicIp = (Invoke-RestMethod -Uri "https://api.ipify.org" -TimeoutSec 5).Trim()
 } catch {
     try {
-        $publicIp = (Invoke-RestMethod -Uri 'https://ifconfig.me/ip' -TimeoutSec 6).Trim()
-    } catch {
-        $publicIp = (Get-NetIPAddress -AddressFamily IPv4 -InterfaceAlias 'Ethernet*' | Where-Object { $_.IPAddress -notlike '169.*' -and $_.IPAddress -notlike '127.*' } | Select-Object -First 1).IPAddress
-    }
+        $publicIp = (Invoke-RestMethod -Uri "https://icanhazip.com" -TimeoutSec 5).Trim()
+    } catch {}
 }
 
-# Tom tat thong tin cho nguoi dung
-Clear-Host
-Write-Host '==========================================================' -ForegroundColor Green
-Write-Host '             CAI DAT HOAN TAT THANH CONG!                 ' -ForegroundColor Green
-Write-Host '==========================================================' -ForegroundColor Green
-Write-Host ''
-Write-Host 'THONG TIN KET NOI VPS:' -ForegroundColor Yellow
-Write-Host "  - IPv4 Public cua VPS   : $publicIp" -ForegroundColor Cyan
-Write-Host "  - Ten User Windows      : $currentUser" -ForegroundColor Cyan
-Write-Host "  - Mat khau User Windows : $finalPassword" -ForegroundColor Cyan
-Write-Host ''
-Write-Host 'CAC BUOC TIEP THEO:' -ForegroundColor Yellow
-Write-Host '  1. Trinh duyet da mo trang https://localhost:47990 (Bo qua canh bao SSL neu co).'
-Write-Host '  2. Dat Username va Password quan tri cho Web UI Sunshine lan dau tien dang nhap.'
-Write-Host "  3. Mo Moonlight tren may khach (Client) -> Nhap IP: $publicIp de ghep noi ma PIN."
-Write-Host '==========================================================' -ForegroundColor Green
-Write-Host ''
-Read-Host 'Nhan Enter de ket thuc script...'
-'@ | Out-File -FilePath 'C:\setup-sunshine.ps1' -Encoding utf8 -Force; powershell.exe -ExecutionPolicy Bypass -File 'C:\setup-sunshine.ps1'
+# ---------------------------------------------------------
+# 5. MO TRINH DUYET VA HIEN THI THONG TIN
+# ---------------------------------------------------------
+Write-Host "[+] Dang mo Sunshine Web UI tren trinh duyet mac dinh..." -ForegroundColor Cyan
+Start-Process "https://localhost:47990"
+
+Write-Host "`n==========================================================" -ForegroundColor Green
+Write-Host "                 CAI DAT HOAN TAT THIET LAP!              " -ForegroundColor Yellow
+Write-Host "==========================================================" -ForegroundColor Green
+Write-Host " 1. IP Public VPS (Moonlight IP) : $publicIp" -ForegroundColor Cyan
+Write-Host " 2. Mat khau Windows VPS         : $finalPass" -ForegroundColor Cyan
+Write-Host " 3. Web UI Sunshine (Local)      : https://localhost:47990" -ForegroundColor Cyan
+Write-Host " 4. Web UI Sunshine (Tu xa)      : https://${publicIp}:47990" -ForegroundColor Cyan
+Write-Host " 5. Dang nhap Sunshine Web UI    : admin / $finalPass" -ForegroundColor Cyan
+Write-Host "==========================================================" -ForegroundColor Green
+Write-Host "Luu y: Tren trinh duyet, hay chon 'Advanced' -> 'Proceed to localhost' vi chung chi SSL tu sinh." -ForegroundColor Gray
