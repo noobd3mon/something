@@ -1,198 +1,570 @@
 <#
-.SYNOPSIS
-    Automated Sunshine & VPS Setup Script
-.DESCRIPTION
-    - Set Windows password (@Noobdz123 default or custom input with confirmation)
-    - Disable Windows Firewall completely
-    - Auto-fetch latest Sunshine release using curl.exe
-    - Configure Sunshine Web UI admin credentials
-    - Fetch Public IPv4 and open Sunshine Web UI in browser
-.NOTES
-    Run as Administrator.
+================================================================================
+ setup-sunshine.ps1  --  Tu dong cai dat + cau hinh Sunshine tren VPS Windows
+--------------------------------------------------------------------------------
+ Cac buoc script tu lam:
+   1. Kiem tra quyen Administrator
+   2. Tai + cai dat Sunshine im lang (uu tien MSI, fallback EXE)
+   3. Bat service SunshineService va cho tu dong chay cung Windows
+   4. Mo firewall cho cac port cua Sunshine, roi TAT Windows Firewall (yeu cau VPS)
+   5. Dat mat khau tai khoan Windows (mac dinh @Noobdz123 hoac tu nhap + confirm)
+   6. Dat luon user/pass dang nhap Web UI cua Sunshine
+   7. Mo https://localhost:47990 bang trinh duyet mac dinh
+   8. In ra IPv4 noi bo + IPv4 public de ket noi tu ben ngoai
+--------------------------------------------------------------------------------
+ CACH DUNG (PowerShell -> Run as Administrator):
+
+   # 1 lenh, dung mat khau mac dinh / nhap mat khau khi duoc hoi
+   irm https://raw.githubusercontent.com/USER/REPO/main/setup-sunshine.ps1 | iex
+
+   # Khong hoi gi ca, ep dung mat khau mac dinh @Noobdz123
+   $env:SUNSHINE_USE_DEFAULT_PASSWORD='1'; irm https://raw.githubusercontent.com/USER/REPO/main/setup-sunshine.ps1 | iex
+
+   # Truyen mat khau rieng qua tham so
+   & ([scriptblock]::Create((irm https://raw.githubusercontent.com/USER/REPO/main/setup-sunshine.ps1))) -Password 'MatKhauCuaBan'
+--------------------------------------------------------------------------------
+ Luu y: file khong dung ky tu co dau de tranh loi encoding tren PowerShell 5.1.
+================================================================================
 #>
 
-#Requires -RunAsAdministrator
-$ErrorActionPreference = "Stop"
+[CmdletBinding()]
+param(
+    # Mat khau Windows muon dat. De trong = hoi truc tiep / dung mac dinh.
+    [string]$Password,
 
-Clear-Host
-Write-Host "==========================================================" -ForegroundColor Cyan
-Write-Host "         AUTO SETUP SUNSHINE & VPS CONFIGURATION          " -ForegroundColor Yellow
-Write-Host "==========================================================" -ForegroundColor Cyan
-Write-Host ""
+    # Tai khoan Windows can doi mat khau (mac dinh: user dang dang nhap).
+    [string]$User,
 
-# ---------------------------------------------------------
-# 1. THIET LAP MAT KHAU WINDOWS
-# ---------------------------------------------------------
-$currentUser = [System.Environment]::UserName
-Write-Host "[+] Nguoi dung hien tai tren VPS: $currentUser" -ForegroundColor Green
+    # Ep dung mat khau mac dinh @Noobdz123, khong hoi gi.
+    [switch]$UseDefaultPassword,
 
-$defaultPass = "@Noobdz123"
-Write-Host "Lua chon dat mat khau cho Windows:" -ForegroundColor Cyan
-Write-Host "  [1] Dung mat khau mac dinh: $defaultPass (Nhan Enter hoac chon 1)" -ForegroundColor Gray
-Write-Host "  [2] Tu nhap mat khau moi" -ForegroundColor Gray
-$choice = Read-Host "Nhap lua chon [1/2] (Mac dinh 1)"
+    # Bo qua buoc doi mat khau Windows.
+    [switch]$SkipPassword,
 
-$finalPass = $defaultPass
+    # Giu nguyen Windows Firewall (chi them rule, khong tat firewall).
+    [switch]$KeepFirewall,
 
-if ($choice -eq "2") {
-    while ($true) {
-        $p1 = Read-Host "Nhap mat khau moi" -AsSecureString
-        $p2 = Read-Host "Xac nhan lai mat khau" -AsSecureString
-        
-        $bstr1 = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($p1)
-        $bstr2 = [System.Runtime.InteropServices.Marshal]::SecureStringToBSTR($p2)
-        $plain1 = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr1)
-        $plain2 = [System.Runtime.InteropServices.Marshal]::PtrToStringAuto($bstr2)
-        
-        if ($plain1 -eq $plain2 -and -not [string]::IsNullOrWhiteSpace($plain1)) {
-            $finalPass = $plain1
-            Write-Host "[OK] Mat khau xac nhan hop le!" -ForegroundColor Green
-            break
-        } else {
-            Write-Host "[!] Mat khau khong khop hoac de trong, vui long thu lai.`n" -ForegroundColor Red
+    # Khong tu mo trinh duyet.
+    [switch]$NoBrowser,
+
+    # Khong dat user/pass cho Web UI Sunshine.
+    [switch]$SkipWebUiCreds,
+
+    # Ten dang nhap Web UI Sunshine.
+    [string]$WebUiUser = 'admin',
+
+    # Cai lai Sunshine du da co san.
+    [switch]$Force
+)
+
+# ------------------------------------------------------------------ Cau hinh --
+$ErrorActionPreference = 'Stop'
+$ProgressPreference    = 'SilentlyContinue'
+
+$script:DefaultPassword = '@Noobdz123'
+$script:WebUiPort       = 47990
+$script:ServiceName     = 'SunshineService'
+$script:LogFile         = Join-Path $env:ProgramData 'sunshine-setup.log'
+$script:TcpPorts        = @('47984-47990', '48010')
+$script:UdpPorts        = @('5353', '47998-48010', '48100-48110')
+
+try { [Console]::OutputEncoding = [Text.Encoding]::UTF8 } catch {}
+try { Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force -ErrorAction SilentlyContinue } catch {}
+try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch {}
+
+# Cho phep cau hinh qua bien moi truong (huu ich khi chay kieu "irm ... | iex")
+if (-not $Password -and $env:SUNSHINE_PASSWORD)                     { $Password = $env:SUNSHINE_PASSWORD }
+if (-not $User -and $env:SUNSHINE_USER)                             { $User = $env:SUNSHINE_USER }
+if ($env:SUNSHINE_USE_DEFAULT_PASSWORD -eq '1')                     { $UseDefaultPassword = $true }
+if ($env:SUNSHINE_SKIP_PASSWORD -eq '1')                            { $SkipPassword = $true }
+if ($env:SUNSHINE_KEEP_FIREWALL -eq '1')                            { $KeepFirewall = $true }
+if ($env:SUNSHINE_NO_BROWSER -eq '1')                               { $NoBrowser = $true }
+if ($env:SUNSHINE_SKIP_WEBUI_CREDS -eq '1')                         { $SkipWebUiCreds = $true }
+if ($env:SUNSHINE_FORCE -eq '1')                                    { $Force = $true }
+
+# ------------------------------------------------------------------- Helpers --
+function Write-Line {
+    param([string]$Text = '', [string]$Color = 'Gray')
+    Write-Host $Text -ForegroundColor $Color
+    try { Add-Content -Path $script:LogFile -Value ('[{0}] {1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Text) -ErrorAction SilentlyContinue } catch {}
+}
+function Write-Step { param([string]$Text) Write-Line ''; Write-Line ("==> " + $Text) 'Cyan' }
+function Write-Ok   { param([string]$Text) Write-Line ("    [OK] " + $Text) 'Green' }
+function Write-Note { param([string]$Text) Write-Line ("    [--] " + $Text) 'Gray' }
+function Write-Warn { param([string]$Text) Write-Line ("    [!] " + $Text) 'Yellow' }
+function Write-Bad  { param([string]$Text) Write-Line ("    [X] " + $Text) 'Red' }
+
+function Test-IsAdmin {
+    try {
+        $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+        $pr = New-Object Security.Principal.WindowsPrincipal($id)
+        return $pr.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch { return $false }
+}
+
+function ConvertTo-Plain {
+    param([Security.SecureString]$Secure)
+    if (-not $Secure) { return '' }
+    $bstr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($Secure)
+    try { return [Runtime.InteropServices.Marshal]::PtrToStringBSTR($bstr) }
+    finally { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($bstr) }
+}
+
+function Test-PortOpen {
+    param([int]$Port, [int]$TimeoutMs = 1000)
+    $client = $null
+    try {
+        $client = New-Object Net.Sockets.TcpClient
+        $async  = $client.BeginConnect('127.0.0.1', $Port, $null, $null)
+        if ($async.AsyncWaitHandle.WaitOne($TimeoutMs) -and $client.Connected) { return $true }
+        return $false
+    } catch { return $false }
+    finally { if ($client) { try { $client.Close() } catch {} } }
+}
+
+function Get-CpuArch {
+    $arch = $env:PROCESSOR_ARCHITECTURE
+    if ($env:PROCESSOR_ARCHITEW6432) { $arch = $env:PROCESSOR_ARCHITEW6432 }
+    if ($arch -match 'ARM64') { return 'ARM64' }
+    return 'AMD64'
+}
+
+function Get-SunshineExe {
+    $paths = New-Object System.Collections.Generic.List[string]
+    if ($env:ProgramFiles) { $paths.Add((Join-Path $env:ProgramFiles 'Sunshine\sunshine.exe')) }
+    if (${env:ProgramFiles(x86)}) { $paths.Add((Join-Path ${env:ProgramFiles(x86)} 'Sunshine\sunshine.exe')) }
+
+    try {
+        $svc = Get-CimInstance -ClassName Win32_Service -Filter "Name='$($script:ServiceName)'" -ErrorAction SilentlyContinue
+        if ($svc -and $svc.PathName) {
+            $imagePath = ($svc.PathName -replace '"', '').Trim()
+            $dir = Split-Path -Parent $imagePath
+            if ($dir) { $paths.Add((Join-Path $dir 'sunshine.exe')) }
         }
-    }
-}
+    } catch {}
 
-try {
-    net user "$currentUser" "$finalPass" | Out-Null
-    Write-Host "[+] Da set mat khau Windows thanh cong!" -ForegroundColor Green
-} catch {
-    Write-Warning "Khong the set mat khau qua net user: $_"
-}
-
-# ---------------------------------------------------------
-# 2. TAT TUONG LUA (WINDOWS FIREWALL)
-# ---------------------------------------------------------
-Write-Host "`n[+] Dang tat Windows Firewall de mo toan bo port..." -ForegroundColor Cyan
-try {
-    Set-NetFirewallProfile -Profile Domain, Public, Private -Enabled False
-    netsh advfirewall set allprofiles state off | Out-Null
-    Write-Host "[+] Da tat hoan toan Windows Firewall!" -ForegroundColor Green
-} catch {
-    Write-Warning "Khong the tat Firewall: $_"
-}
-
-# ---------------------------------------------------------
-# 3. TAI VA CAI DAT SUNSHINE (DUNG CURL.EXE)
-# ---------------------------------------------------------
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
-$TempDir = [System.IO.Path]::GetTempPath()
-$InstallerPath = Join-Path -Path $TempDir -ChildPath "sunshine-installer.exe"
-if (Test-Path $InstallerPath) { Remove-Item -Path $InstallerPath -Force }
-
-Write-Host "`n[+] Dang tim link tai Sunshine Release moi nhat..." -ForegroundColor Cyan
-
-$DownloadUrls = @()
-try {
-    $api = Invoke-RestMethod -Uri "https://api.github.com/repos/LizardByte/Sunshine/releases/latest" -Headers @{"User-Agent"="Mozilla/5.0"} -TimeoutSec 10
-    $assets = $api.assets | Where-Object { $_.name -like "*installer.exe" -or ($_.name -like "*.exe" -and $_.name -notlike "*portable*") }
-    foreach ($a in $assets) {
-        $DownloadUrls += $a.browser_download_url
-    }
-} catch {}
-
-# URL fallback neu API bi gioi han
-$DownloadUrls += "https://github.com/LizardByte/Sunshine/releases/latest/download/sunshine-windows-amd64-installer.exe"
-$DownloadUrls += "https://github.com/LizardByte/Sunshine/releases/latest/download/sunshine-windows-installer.exe"
-
-$downloadSuccess = $false
-$curlExe = "$env:SystemRoot\System32\curl.exe"
-
-foreach ($url in $DownloadUrls) {
-    Write-Host "[+] Dang thu tai tu: $url" -ForegroundColor Cyan
-    
-    if (Test-Path $curlExe) {
-        # Dung curl.exe goc cua Windows: -L (follow redirect), -f (fail neu 404), -k (insecure ssl fallback), -s (silent)
-        & $curlExe -f -L --retry 3 --retry-delay 2 -k -o "$InstallerPath" "$url"
-    } else {
-        # Fallback neu VPS khong co curl.exe
+    foreach ($key in @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*'
+    )) {
         try {
-            $OriginalProgressPreference = $ProgressPreference
-            $ProgressPreference = 'SilentlyContinue'
-            Invoke-WebRequest -Uri $url -OutFile $InstallerPath -UseBasicParsing -UserAgent "Mozilla/5.0"
-            $ProgressPreference = $OriginalProgressPreference
+            Get-ItemProperty -Path $key -ErrorAction SilentlyContinue |
+                Where-Object { $_.DisplayName -like '*Sunshine*' -and $_.InstallLocation } |
+                ForEach-Object { $paths.Add((Join-Path $_.InstallLocation 'sunshine.exe')) }
         } catch {}
     }
 
-    # Kiem tra file phai ton tai va dung luong > 10MB (tranh file HTML loi)
-    if ((Test-Path $InstallerPath) -and ((Get-Item $InstallerPath).Length -gt 10485760)) {
-        $fileSizeMB = [math]::Round(((Get-Item $InstallerPath).Length / 1MB), 2)
-        Write-Host "[+] Tai thanh cong! Dung luong: $fileSizeMB MB" -ForegroundColor Green
-        $downloadSuccess = $true
-        break
-    } else {
-        if (Test-Path $InstallerPath) { Remove-Item -Path $InstallerPath -Force }
+    foreach ($p in $paths) {
+        if ($p -and (Test-Path -LiteralPath $p)) { return (Resolve-Path -LiteralPath $p).Path }
     }
+    return $null
 }
 
-if (-not $downloadSuccess) {
-    Write-Error "Khong the tai bo cai Sunshine. Vui long kiem tra lai ket noi mang."
-    Exit
+function Invoke-Download {
+    param([string]$Url, [string]$OutFile)
+    Write-Note "Tai: $Url"
+    try {
+        Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing -TimeoutSec 900
+    } catch {
+        Write-Warn "Invoke-WebRequest loi: $($_.Exception.Message). Thu lai bang WebClient..."
+        try { (New-Object Net.WebClient).DownloadFile($Url, $OutFile) }
+        catch { Write-Bad "Tai that bai: $($_.Exception.Message)"; return $false }
+    }
+    if ((Test-Path -LiteralPath $OutFile) -and ((Get-Item -LiteralPath $OutFile).Length -gt 1MB)) {
+        $mb = [math]::Round((Get-Item -LiteralPath $OutFile).Length / 1MB, 1)
+        Write-Note ("Da tai xong (" + $mb + " MB)")
+        return $true
+    }
+    Write-Bad 'File tai ve khong hop le (qua nho).'
+    return $false
 }
 
-Write-Host "`n[+] Dang cai dat Sunshine (Silent)..." -ForegroundColor Cyan
+function Wait-ForSunshineExe {
+    param([int]$TimeoutSec = 90)
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    while ((Get-Date) -lt $deadline) {
+        $exe = Get-SunshineExe
+        if ($exe) { return $exe }
+        Start-Sleep -Seconds 3
+    }
+    return $null
+}
+
+# ---------------------------------------------------------------- Cai Sunshine --
+function Install-Sunshine {
+    $arch    = Get-CpuArch
+    $baseUrl = 'https://github.com/LizardByte/Sunshine/releases/latest/download'
+    $tmpDir  = Join-Path $env:TEMP ('sunshine-setup-' + (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    New-Item -ItemType Directory -Path $tmpDir -Force | Out-Null
+    Write-Note "Kien truc CPU: $arch | Thu muc tam: $tmpDir"
+
+    # --- Cach 1: MSI (LizardByte khuyen nghi, cai im lang on dinh nhat) ---
+    $msiPath = Join-Path $tmpDir "Sunshine-Windows-$arch-installer.msi"
+    if (Invoke-Download "$baseUrl/Sunshine-Windows-$arch-installer.msi" $msiPath) {
+        Write-Note 'Cai dat im lang bang msiexec /qn ...'
+        $msiLog  = Join-Path $tmpDir 'msi-install.log'
+        $msiArgs = @('/i', ('"' + $msiPath + '"'), '/qn', '/norestart', '/L*v', ('"' + $msiLog + '"'))
+        try {
+            $proc = Start-Process -FilePath 'msiexec.exe' -ArgumentList $msiArgs -PassThru
+            $proc.WaitForExit()
+            $code = $proc.ExitCode
+            Write-Note "msiexec ket thuc voi ma: $code"
+            if (@(0, 1641, 3010) -contains $code) {
+                $exe = Wait-ForSunshineExe -TimeoutSec 60
+                if ($exe) { Write-Ok "Da cai Sunshine (MSI): $exe"; return $exe }
+            }
+        } catch { Write-Warn "msiexec loi: $($_.Exception.Message)" }
+        Write-Warn 'Cai bang MSI khong thanh cong, chuyen sang ban EXE...'
+    }
+
+    # --- Cach 2: EXE cai im lang ---
+    $exePath = Join-Path $tmpDir "Sunshine-Windows-$arch-installer.exe"
+    if (Invoke-Download "$baseUrl/Sunshine-Windows-$arch-installer.exe" $exePath) {
+        $argSets = New-Object System.Collections.Generic.List[object]
+        $argSets.Add(@('/S'))
+        $argSets.Add(@('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART'))
+        foreach ($silentArgs in $argSets) {
+            Write-Note ("Chay installer voi tham so: " + ($silentArgs -join ' '))
+            try {
+                $proc = Start-Process -FilePath $exePath -ArgumentList $silentArgs -PassThru
+                $proc.WaitForExit()
+                Write-Note "Installer ket thuc voi ma: $($proc.ExitCode)"
+            } catch { Write-Warn "Loi khi chay installer: $($_.Exception.Message)" }
+
+            $exe = Wait-ForSunshineExe -TimeoutSec 60
+            if ($exe) { Write-Ok "Da cai Sunshine (EXE): $exe"; return $exe }
+        }
+
+        # --- Cach 3: mo installer o che do thu cong ---
+        Write-Warn 'Cai im lang that bai. Mo installer de ban bam Next -> Install thu cong...'
+        try {
+            $proc = Start-Process -FilePath $exePath -PassThru
+            $proc.WaitForExit()
+        } catch { Write-Bad "Khong mo duoc installer: $($_.Exception.Message)" }
+        $exe = Wait-ForSunshineExe -TimeoutSec 30
+        if ($exe) { Write-Ok "Da cai Sunshine: $exe"; return $exe }
+    }
+
+    return $null
+}
+
+# ------------------------------------------------------------------- Service --
+function Start-SunshineService {
+    $svc = Get-Service -Name $script:ServiceName -ErrorAction SilentlyContinue
+    if (-not $svc) {
+        Write-Warn "Khong thay service $($script:ServiceName). Sunshine co the dang chay o che do ung dung."
+        return $false
+    }
+    try { Set-Service -Name $script:ServiceName -StartupType Automatic } catch { Write-Warn "Khong dat duoc Automatic: $($_.Exception.Message)" }
+    try {
+        if ($svc.Status -ne 'Running') { Start-Service -Name $script:ServiceName }
+        else { Restart-Service -Name $script:ServiceName -Force }
+    } catch { Write-Warn "Khong start duoc service: $($_.Exception.Message)" }
+
+    $deadline = (Get-Date).AddSeconds(60)
+    while ((Get-Date) -lt $deadline) {
+        if (Test-PortOpen -Port $script:WebUiPort) {
+            Write-Ok "Sunshine dang lang nghe tai port $($script:WebUiPort)."
+            return $true
+        }
+        Start-Sleep -Seconds 2
+    }
+    Write-Warn "Chua thay port $($script:WebUiPort) mo. Neu VPS chua co phien dang nhap (session) thi Sunshine se chua khoi dong duoc."
+    return $false
+}
+
+# ------------------------------------------------------------------ Firewall --
+function Set-SunshineFirewall {
+    param([switch]$KeepEnabled)
+
+    $tcpList = ($script:TcpPorts -join ',')
+    $udpList = ($script:UdpPorts -join ',')
+
+    $rules = @(
+        @{ Name = 'Sunshine TCP In';  Protocol = 'TCP'; Ports = $script:TcpPorts; PortText = $tcpList },
+        @{ Name = 'Sunshine UDP In';  Protocol = 'UDP'; Ports = $script:UdpPorts; PortText = $udpList }
+    )
+
+    foreach ($rule in $rules) {
+        $added = $false
+        try {
+            Get-NetFirewallRule -DisplayName $rule.Name -ErrorAction SilentlyContinue | Remove-NetFirewallRule -ErrorAction SilentlyContinue
+            New-NetFirewallRule -DisplayName $rule.Name -Direction Inbound -Action Allow `
+                -Protocol $rule.Protocol -LocalPort $rule.Ports -Profile Any -ErrorAction Stop | Out-Null
+            $added = $true
+        } catch {
+            try {
+                $delArgs = @('advfirewall', 'firewall', 'delete', 'rule', ('name=' + $rule.Name))
+                $addArgs = @('advfirewall', 'firewall', 'add', 'rule', ('name=' + $rule.Name),
+                             'dir=in', 'action=allow', ('protocol=' + $rule.Protocol), ('localport=' + $rule.PortText))
+                & netsh.exe @delArgs | Out-Null
+                & netsh.exe @addArgs | Out-Null
+                $added = $true
+            } catch { Write-Warn "Khong tao duoc rule $($rule.Name): $($_.Exception.Message)" }
+        }
+        if ($added) { Write-Ok "Rule '$($rule.Name)': $($rule.Protocol) $($rule.PortText)" }
+    }
+
+    if ($KeepEnabled) {
+        Write-Note 'Giu nguyen Windows Firewall (chi them rule) vi ban dung -KeepFirewall.'
+        return
+    }
+
+    try {
+        Set-NetFirewallProfile -Profile Domain, Private, Public -Enabled False -ErrorAction Stop
+        Write-Ok 'Da TAT Windows Firewall (ca 3 profile: Domain / Private / Public).'
+    } catch {
+        try {
+            & netsh.exe advfirewall set allprofiles state off | Out-Null
+            Write-Ok 'Da TAT Windows Firewall bang netsh.'
+        } catch { Write-Bad "Khong tat duoc firewall: $($_.Exception.Message)" }
+    }
+    Write-Warn 'Firewall dang TAT: may nay mo hoan toan ra Internet. Nen dat mat khau manh va bat lai firewall khi khong dung.'
+}
+
+# ------------------------------------------------------------------ Dia chi IP --
+function Get-LocalIPv4 {
+    $ips = @()
+    try {
+        $ips = Get-NetIPAddress -AddressFamily IPv4 -ErrorAction Stop |
+            Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' } |
+            Select-Object -ExpandProperty IPAddress
+    } catch {
+        try {
+            $ips = [Net.Dns]::GetHostAddresses($env:COMPUTERNAME) |
+                Where-Object { $_.AddressFamily -eq 'InterNetwork' } |
+                ForEach-Object { $_.IPAddressToString } |
+                Where-Object { $_ -notlike '127.*' -and $_ -notlike '169.254.*' }
+        } catch {}
+    }
+    return @($ips | Sort-Object -Unique)
+}
+
+function Get-PublicIPv4 {
+    foreach ($url in @('https://api.ipify.org', 'https://ifconfig.me/ip', 'https://icanhazip.com', 'http://checkip.amazonaws.com')) {
+        try {
+            $resp = Invoke-RestMethod -Uri $url -TimeoutSec 10
+            $ip   = ($resp | Out-String).Trim()
+            if ($ip -match '^\d{1,3}(\.\d{1,3}){3}$') { return $ip }
+        } catch {}
+    }
+    return $null
+}
+
+# -------------------------------------------------------------- Mat khau may --
+function Get-DesiredPassword {
+    param([string]$Provided, [switch]$ForceDefault)
+
+    if ($Provided)    { Write-Note 'Dung mat khau truyen tu tham so/bien moi truong.'; return $Provided }
+    if ($ForceDefault) { Write-Note 'Dung mat khau mac dinh.'; return $script:DefaultPassword }
+
+    Write-Line "    Mat khau mac dinh: $($script:DefaultPassword)" 'White'
+    Write-Line '    Nhan Enter de dung mat khau mac dinh, hoac nhap mat khau moi cua ban.' 'White'
+
+    for ($i = 1; $i -le 3; $i++) {
+        try   { $first = Read-Host -Prompt '    Mat khau moi' -AsSecureString }
+        catch { Write-Warn 'Khong nhap duoc tu ban phim (che do khong tuong tac). Dung mat khau mac dinh.'; return $script:DefaultPassword }
+
+        $plain1 = ConvertTo-Plain $first
+        if ([string]::IsNullOrEmpty($plain1)) {
+            Write-Note 'Da chon mat khau mac dinh.'
+            return $script:DefaultPassword
+        }
+
+        $second = Read-Host -Prompt '    Nhap lai mat khau de xac nhan' -AsSecureString
+        $plain2 = ConvertTo-Plain $second
+
+        if ($plain1 -ceq $plain2) {
+            if ($plain1.Length -lt 8) { Write-Warn 'Mat khau ngan hon 8 ky tu, Windows co the tu choi vi chinh sach do phuc tap.' }
+            Write-Ok 'Hai lan nhap trung khop.'
+            return $plain1
+        }
+        Write-Bad "Hai lan nhap KHONG giong nhau. Thu lai ($i/3)."
+    }
+
+    Write-Warn 'Nhap sai 3 lan. Dung mat khau mac dinh.'
+    return $script:DefaultPassword
+}
+
+function Set-WindowsPassword {
+    param([string]$UserName, [string]$Plain)
+
+    if (-not $UserName) { $UserName = $env:USERNAME }
+    Write-Note "Tai khoan se doi mat khau: $UserName"
+
+    try {
+        $secure = ConvertTo-SecureString $Plain -AsPlainText -Force
+        Get-LocalUser -Name $UserName -ErrorAction Stop | Out-Null
+        Set-LocalUser -Name $UserName -Password $secure -PasswordNeverExpires $true -ErrorAction Stop
+        try { Enable-LocalUser -Name $UserName -ErrorAction SilentlyContinue } catch {}
+        Write-Ok "Da doi mat khau Windows cho '$UserName'."
+        return $true
+    } catch {
+        Write-Warn "Set-LocalUser khong dung duoc ($($_.Exception.Message)). Thu bang net.exe user..."
+    }
+
+    try {
+        $out = & net.exe user $UserName $Plain 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            Write-Ok "Da doi mat khau Windows cho '$UserName' (net user)."
+            try { & net.exe accounts /maxpwage:unlimited | Out-Null } catch {}
+            return $true
+        }
+        Write-Bad ('net user loi: ' + (($out | Out-String).Trim()))
+    } catch { Write-Bad "Khong doi duoc mat khau: $($_.Exception.Message)" }
+
+    return $false
+}
+
+# ------------------------------------------------------- Mat khau Web UI Sunshine --
+function Set-SunshineWebCreds {
+    param([string]$Exe, [string]$UserName, [string]$Plain)
+
+    if (-not $Exe -or -not (Test-Path -LiteralPath $Exe)) { return $false }
+
+    $svc = Get-Service -Name $script:ServiceName -ErrorAction SilentlyContinue
+    $wasRunning = ($svc -and $svc.Status -eq 'Running')
+    if ($wasRunning) { try { Stop-Service -Name $script:ServiceName -Force; Start-Sleep -Seconds 2 } catch {} }
+
+    $ok = $false
+    try {
+        $credArgs = @('--creds', ('"' + $UserName + '"'), ('"' + $Plain + '"'))
+        $proc = Start-Process -FilePath $Exe -ArgumentList $credArgs -NoNewWindow -PassThru
+        if (-not $proc.WaitForExit(30000)) { try { $proc.Kill() } catch {} }
+        $ok = $true
+        Write-Ok "Da dat dang nhap Web UI Sunshine: user '$UserName'."
+    } catch { Write-Warn "Khong dat duoc user/pass Web UI tu dong: $($_.Exception.Message). Ban co the tao truc tiep tren trang web." }
+
+    if ($wasRunning -or $svc) {
+        try { Start-Service -Name $script:ServiceName -ErrorAction SilentlyContinue } catch {}
+    }
+    return $ok
+}
+
+# ------------------------------------------------------------------- Trinh duyet --
+function Open-WebUi {
+    param([string]$Url)
+    $attempts = @(
+        { Start-Process $Url },
+        { Start-Process 'msedge.exe' $Url },
+        { Start-Process 'chrome.exe' $Url },
+        { Start-Process 'cmd.exe' ('/c start "" "' + $Url + '"') }
+    )
+    foreach ($attempt in $attempts) {
+        try { & $attempt; Write-Ok "Da mo $Url tren trinh duyet."; return $true } catch {}
+    }
+    Write-Warn "Khong mo duoc trinh duyet tu dong. Hay mo tay: $Url"
+    return $false
+}
+
+# ------------------------------------------------------------------------ Main --
+function Invoke-SunshineSetup {
+    Write-Line ''
+    Write-Line '################################################################' 'Cyan'
+    Write-Line '#          SUNSHINE VPS AUTO SETUP  (Windows PowerShell)        #' 'Cyan'
+    Write-Line '################################################################' 'Cyan'
+    Write-Note "Log: $($script:LogFile)"
+
+    # 1. Quyen Administrator
+    Write-Step 'Buoc 1/7: Kiem tra quyen Administrator'
+    if (-not (Test-IsAdmin)) {
+        Write-Bad 'Script CAN quyen Administrator.'
+        Write-Line '    Hay mo Start -> go "PowerShell" -> chuot phai -> Run as administrator, roi chay lai lenh.' 'Yellow'
+        return
+    }
+    Write-Ok "Dang chay voi quyen admin ($env:USERDOMAIN\$env:USERNAME)."
+
+    # 2. Cai Sunshine
+    Write-Step 'Buoc 2/7: Cai dat Sunshine'
+    $exe = Get-SunshineExe
+    if ($exe -and -not $Force) {
+        Write-Ok "Sunshine da co san: $exe (dung -Force de cai lai)"
+    } else {
+        $exe = Install-Sunshine
+        if (-not $exe) {
+            Write-Bad 'Khong cai duoc Sunshine. Kiem tra ket noi mang cua VPS roi chay lai script.'
+            return
+        }
+    }
+
+    # 3. Service
+    Write-Step 'Buoc 3/7: Bat service Sunshine (tu dong chay cung Windows)'
+    $serviceUp = Start-SunshineService
+
+    # 4. Firewall
+    Write-Step 'Buoc 4/7: Mo port + tat Windows Firewall'
+    if ($KeepFirewall) { Set-SunshineFirewall -KeepEnabled } else { Set-SunshineFirewall }
+
+    # 5. Mat khau Windows
+    Write-Step 'Buoc 5/7: Dat mat khau tai khoan Windows'
+    $targetUser   = if ($User) { $User } else { $env:USERNAME }
+    $finalPassword = $null
+    if ($SkipPassword) {
+        Write-Note 'Bo qua buoc doi mat khau (-SkipPassword).'
+    } else {
+        $finalPassword = Get-DesiredPassword -Provided $Password -ForceDefault:$UseDefaultPassword
+        if (-not (Set-WindowsPassword -UserName $targetUser -Plain $finalPassword)) {
+            Write-Warn 'Khong doi duoc mat khau Windows. Mat khau cu van giu nguyen.'
+        }
+    }
+
+    # 6. Web UI creds + mo trinh duyet
+    Write-Step 'Buoc 6/7: Cau hinh Web UI Sunshine'
+    $webPassword = $null
+    if (-not $SkipWebUiCreds) {
+        $webPassword = if ($finalPassword) { $finalPassword } else { $script:DefaultPassword }
+        if (-not (Set-SunshineWebCreds -Exe $exe -UserName $WebUiUser -Plain $webPassword)) { $webPassword = $null }
+    } else {
+        Write-Note 'Bo qua dat user/pass Web UI (-SkipWebUiCreds).'
+    }
+
+    $localUrl = "https://localhost:$($script:WebUiPort)"
+    if (-not $serviceUp) {
+        $deadline = (Get-Date).AddSeconds(20)
+        while ((Get-Date) -lt $deadline -and -not (Test-PortOpen -Port $script:WebUiPort)) { Start-Sleep -Seconds 2 }
+    }
+    if ($NoBrowser) { Write-Note 'Bo qua mo trinh duyet (-NoBrowser).' } else { Open-WebUi -Url $localUrl | Out-Null }
+
+    # 7. Tong ket + IP
+    Write-Step 'Buoc 7/7: Thong tin ket noi'
+    $localIps = Get-LocalIPv4
+    $publicIp = Get-PublicIPv4
+    $mainIp   = if ($publicIp) { $publicIp } elseif ($localIps.Count -gt 0) { $localIps[0] } else { 'IP_CUA_VPS' }
+    $publicIpText = if ($publicIp) { $publicIp } else { 'khong xac dinh duoc' }
+    $localIpText  = if ($localIps.Count -gt 0) { ($localIps -join ', ') } else { 'khong xac dinh duoc' }
+
+    Write-Line ''
+    Write-Line '================================================================' 'Green'
+    Write-Line '                  HOAN TAT - THONG TIN TRUY CAP                 ' 'Green'
+    Write-Line '================================================================' 'Green'
+    Write-Line "  IPv4 public (dung tu ben ngoai) : $publicIpText" 'White'
+    Write-Line "  IPv4 noi bo cua may             : $localIpText" 'White'
+    Write-Line ''
+    Write-Line "  Web UI tren may nay             : $localUrl" 'White'
+    Write-Line "  Web UI tu may khac              : https://${mainIp}:$($script:WebUiPort)" 'White'
+    Write-Line "  Dia chi nhap vao Moonlight      : $mainIp" 'White'
+    Write-Line ''
+    Write-Line "  Tai khoan Windows               : $targetUser" 'White'
+    if ($finalPassword) { Write-Line "  Mat khau Windows                : $finalPassword" 'Yellow' }
+    else                { Write-Line '  Mat khau Windows                : (khong doi)' 'Gray' }
+    if ($webPassword)   { Write-Line "  Web UI Sunshine                 : $WebUiUser / $webPassword" 'Yellow' }
+    else                { Write-Line '  Web UI Sunshine                 : tu tao user/pass o lan mo dau tien' 'Gray' }
+    Write-Line '================================================================' 'Green'
+    Write-Line ''
+    Write-Line '  Ghi chu quan trong:' 'Cyan'
+    Write-Line '   1. Trinh duyet se canh bao "khong an toan" vi Sunshine dung SSL tu ky -> chon Advanced / Continue.' 'Gray'
+    Write-Line '   2. Neu VPS o Azure / AWS / GCP: phai mo them port trong Security Group / NSG cua nha cung cap' 'Gray'
+    Write-Line "      TCP $($script:TcpPorts -join ', ') va UDP $($script:UdpPorts -join ', ')" 'Gray'
+    Write-Line '   3. Sunshine can mot phien man hinh dang mo. Tren VPS nen cai virtual display driver' 'Gray'
+    Write-Line '      va giu phien dang nhap (vi du dung: tscon 1 /dest:console) truoc khi ngat RDP.' 'Gray'
+    Write-Line '   4. Ghep doi Moonlight: mo Web UI -> tab PIN -> nhap PIN ma Moonlight hien ra.' 'Gray'
+    Write-Line '   5. Bat lai firewall khi can: Set-NetFirewallProfile -Profile Domain,Private,Public -Enabled True' 'Gray'
+    Write-Line ''
+}
+
 try {
-    $process = Start-Process -FilePath $InstallerPath -ArgumentList "/S" -PassThru -Wait
-    Write-Host "[+] Cai dat Sunshine hoan tat!" -ForegroundColor Green
+    Invoke-SunshineSetup
 } catch {
-    Write-Error "Loi khi chay trinh cai dat: $_"
-    Exit
+    Write-Bad "Loi khong mong doi: $($_.Exception.Message)"
+    Write-Line ($_.ScriptStackTrace) 'DarkGray'
 }
-
-# Khoi tao tai khoan Sunshine Web UI
-$sunshineExe = "C:\Program Files\Sunshine\sunshine.exe"
-if (Test-Path $sunshineExe) {
-    try {
-        & "$sunshineExe" --creds admin "$finalPass" | Out-Null
-        Write-Host "[+] Da set tai khoan Web UI Sunshine: admin / $finalPass" -ForegroundColor Green
-    } catch {}
-}
-
-# Don dep installer
-if (Test-Path $InstallerPath) {
-    Remove-Item -Path $InstallerPath -Force
-}
-
-# ---------------------------------------------------------
-# 4. LAY IPV4 VA THONG TIN KET NOI
-# ---------------------------------------------------------
-Write-Host "`n[+] Dang lay dia chi IPv4 Public cua VPS..." -ForegroundColor Cyan
-$publicIp = "Khong xac dinh"
-$ipServices = @(
-    "https://api.ipify.org",
-    "https://icanhazip.com",
-    "https://ifconfig.me/ip",
-    "https://checkip.amazonaws.com"
-)
-
-foreach ($srv in $ipServices) {
-    try {
-        if (Test-Path $curlExe) {
-            $res = (& $curlExe -s -m 3 $srv).Trim()
-        } else {
-            $res = (Invoke-RestMethod -Uri $srv -TimeoutSec 3).Trim()
-        }
-        if ($res -match "^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$") {
-            $publicIp = $res
-            break
-        }
-    } catch {}
-}
-
-# ---------------------------------------------------------
-# 5. MO TRINH DUYET VA HIEN THI THONG TIN
-# ---------------------------------------------------------
-Write-Host "[+] Dang mo Sunshine Web UI tren trinh duyet..." -ForegroundColor Cyan
-Start-Process "https://localhost:47990"
-
-Write-Host "`n==========================================================" -ForegroundColor Green
-Write-Host "                 CAI DAT HOAN TAT THIET LAP!              " -ForegroundColor Yellow
-Write-Host "==========================================================" -ForegroundColor Green
-Write-Host " 1. IP Public VPS (Moonlight IP) : $publicIp" -ForegroundColor Cyan
-Write-Host " 2. Mat khau Windows VPS         : $finalPass" -ForegroundColor Cyan
-Write-Host " 3. Web UI Sunshine (Local)      : https://localhost:47990" -ForegroundColor Cyan
-Write-Host " 4. Web UI Sunshine (Tu xa)      : https://${publicIp}:47990" -ForegroundColor Cyan
-Write-Host " 5. Tai khoan Sunshine Web UI    : admin / $finalPass" -ForegroundColor Cyan
-Write-Host "==========================================================" -ForegroundColor Green
-Write-Host "Luu y: Trinh duyet bao SSL Warning -> bam 'Advanced' -> 'Proceed to localhost'." -ForegroundColor Gray
