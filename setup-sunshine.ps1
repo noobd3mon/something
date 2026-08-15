@@ -5,12 +5,13 @@
  Cac buoc script tu lam:
    1. Kiem tra quyen Administrator
    2. Tai + cai dat Sunshine im lang (uu tien MSI, fallback EXE)
-   3. Bat service SunshineService va cho tu dong chay cung Windows
-   4. Mo firewall cho cac port cua Sunshine, roi TAT Windows Firewall (yeu cau VPS)
-   5. Dat mat khau tai khoan Windows (mac dinh @Noobdz123 hoac tu nhap + confirm)
-   6. Dat luon user/pass dang nhap Web UI cua Sunshine
-   7. Mo https://localhost:47990 bang trinh duyet mac dinh
-   8. In ra IPv4 noi bo + IPv4 public de ket noi tu ben ngoai
+   3. Bat dich vu am thanh Windows (Audiosrv + AudioEndpointBuilder, startup = auto)
+   4. Bat service SunshineService va cho tu dong chay cung Windows
+   5. Mo firewall cho cac port cua Sunshine, roi TAT Windows Firewall (yeu cau VPS)
+   6. Dat mat khau tai khoan Windows (mac dinh @Noobdz123 hoac tu nhap + confirm)
+   7. Dat luon user/pass dang nhap Web UI cua Sunshine
+   8. Mo https://localhost:47990 bang trinh duyet mac dinh
+   9. In ra IPv4 noi bo + IPv4 public de ket noi tu ben ngoai
 --------------------------------------------------------------------------------
  CACH DUNG (PowerShell -> Run as Administrator):
 
@@ -248,6 +249,57 @@ function Install-Sunshine {
     return $null
 }
 
+# ---------------------------------------------------------- Am thanh Windows --
+function Enable-AudioServices {
+    # Tuong duong voi:
+    #   sc config AudioEndpointBuilder start= auto  +  net start AudioEndpointBuilder
+    #   sc config Audiosrv             start= auto  +  net start Audiosrv
+    $audioServices = @(
+        @{ Name = 'AudioEndpointBuilder'; Label = 'Windows Audio Endpoint Builder' },
+        @{ Name = 'Audiosrv';             Label = 'Windows Audio' }
+    )
+
+    foreach ($item in $audioServices) {
+        $name = $item.Name
+
+        # 1) sc config <ten> start= auto
+        try {
+            $cfgArgs = @('config', $name, 'start=', 'auto')
+            & sc.exe @cfgArgs | Out-Null
+        } catch { Write-Warn "sc config $name loi: $($_.Exception.Message)" }
+        try { Set-Service -Name $name -StartupType Automatic -ErrorAction SilentlyContinue } catch {}
+
+        # 2) net start <ten>
+        $status = 'Unknown'
+        try {
+            $svc = Get-Service -Name $name -ErrorAction Stop
+            if ($svc.Status -ne 'Running') {
+                try { Start-Service -Name $name -ErrorAction Stop }
+                catch { try { & net.exe start $name | Out-Null } catch {} }
+                Start-Sleep -Seconds 2
+                $svc = Get-Service -Name $name -ErrorAction SilentlyContinue
+            }
+            if ($svc) { $status = [string]$svc.Status }
+        } catch {
+            Write-Warn "Khong tim thay dich vu $name tren may nay."
+            continue
+        }
+
+        if ($status -eq 'Running') { Write-Ok "$($item.Label) [$name]: dang chay, startup = Automatic." }
+        else { Write-Warn "$($item.Label) [$name]: trang thai '$status'. Kiem tra lai trong services.msc." }
+    }
+
+    # Liet ke thiet bi am thanh (VPS thuong khong co card am thanh that)
+    try {
+        $devices = Get-CimInstance -ClassName Win32_SoundDevice -ErrorAction SilentlyContinue
+        if ($devices) {
+            foreach ($d in $devices) { Write-Note ('Thiet bi am thanh: ' + $d.Name + ' [' + $d.Status + ']') }
+        } else {
+            Write-Warn 'Khong thay thiet bi am thanh nao. Nen cai them virtual audio driver (VB-CABLE, Virtual Audio Cable...) de Sunshine co dau ra tieng.'
+        }
+    } catch {}
+}
+
 # ------------------------------------------------------------------- Service --
 function Start-SunshineService {
     $svc = Get-Service -Name $script:ServiceName -ErrorAction SilentlyContinue
@@ -466,7 +518,7 @@ function Invoke-SunshineSetup {
     Write-Note "Log: $($script:LogFile)"
 
     # 1. Quyen Administrator
-    Write-Step 'Buoc 1/7: Kiem tra quyen Administrator'
+    Write-Step 'Buoc 1/8: Kiem tra quyen Administrator'
     if (-not (Test-IsAdmin)) {
         Write-Bad 'Script CAN quyen Administrator.'
         Write-Line '    Hay mo Start -> go "PowerShell" -> chuot phai -> Run as administrator, roi chay lai lenh.' 'Yellow'
@@ -475,7 +527,7 @@ function Invoke-SunshineSetup {
     Write-Ok "Dang chay voi quyen admin ($env:USERDOMAIN\$env:USERNAME)."
 
     # 2. Cai Sunshine
-    Write-Step 'Buoc 2/7: Cai dat Sunshine'
+    Write-Step 'Buoc 2/8: Cai dat Sunshine'
     $exe = Get-SunshineExe
     if ($exe -and -not $Force) {
         Write-Ok "Sunshine da co san: $exe (dung -Force de cai lai)"
@@ -487,16 +539,20 @@ function Invoke-SunshineSetup {
         }
     }
 
-    # 3. Service
-    Write-Step 'Buoc 3/7: Bat service Sunshine (tu dong chay cung Windows)'
+    # 3. Am thanh Windows
+    Write-Step 'Buoc 3/8: Bat dich vu am thanh cua Windows'
+    Enable-AudioServices
+
+    # 4. Service
+    Write-Step 'Buoc 4/8: Bat service Sunshine (tu dong chay cung Windows)'
     $serviceUp = Start-SunshineService
 
-    # 4. Firewall
-    Write-Step 'Buoc 4/7: Mo port + tat Windows Firewall'
+    # 5. Firewall
+    Write-Step 'Buoc 5/8: Mo port + tat Windows Firewall'
     if ($KeepFirewall) { Set-SunshineFirewall -KeepEnabled } else { Set-SunshineFirewall }
 
-    # 5. Mat khau Windows
-    Write-Step 'Buoc 5/7: Dat mat khau tai khoan Windows'
+    # 6. Mat khau Windows
+    Write-Step 'Buoc 6/8: Dat mat khau tai khoan Windows'
     $targetUser   = if ($User) { $User } else { $env:USERNAME }
     $finalPassword = $null
     if ($SkipPassword) {
@@ -508,8 +564,8 @@ function Invoke-SunshineSetup {
         }
     }
 
-    # 6. Web UI creds + mo trinh duyet
-    Write-Step 'Buoc 6/7: Cau hinh Web UI Sunshine'
+    # 7. Web UI creds + mo trinh duyet
+    Write-Step 'Buoc 7/8: Cau hinh Web UI Sunshine'
     $webPassword = $null
     if (-not $SkipWebUiCreds) {
         $webPassword = if ($finalPassword) { $finalPassword } else { $script:DefaultPassword }
@@ -525,8 +581,8 @@ function Invoke-SunshineSetup {
     }
     if ($NoBrowser) { Write-Note 'Bo qua mo trinh duyet (-NoBrowser).' } else { Open-WebUi -Url $localUrl | Out-Null }
 
-    # 7. Tong ket + IP
-    Write-Step 'Buoc 7/7: Thong tin ket noi'
+    # 8. Tong ket + IP
+    Write-Step 'Buoc 8/8: Thong tin ket noi'
     $localIps = Get-LocalIPv4
     $publicIp = Get-PublicIPv4
     $mainIp   = if ($publicIp) { $publicIp } elseif ($localIps.Count -gt 0) { $localIps[0] } else { 'IP_CUA_VPS' }
@@ -559,6 +615,8 @@ function Invoke-SunshineSetup {
     Write-Line '      va giu phien dang nhap (vi du dung: tscon 1 /dest:console) truoc khi ngat RDP.' 'Gray'
     Write-Line '   4. Ghep doi Moonlight: mo Web UI -> tab PIN -> nhap PIN ma Moonlight hien ra.' 'Gray'
     Write-Line '   5. Bat lai firewall khi can: Set-NetFirewallProfile -Profile Domain,Private,Public -Enabled True' 'Gray'
+    Write-Line '   6. Am thanh: da bat Audiosrv + AudioEndpointBuilder (startup = auto). Neu VPS khong co card am thanh,' 'Gray'
+    Write-Line '      cai them virtual audio driver (VB-CABLE...) roi chon dung Audio Sink trong Web UI Sunshine.' 'Gray'
     Write-Line ''
 }
 
